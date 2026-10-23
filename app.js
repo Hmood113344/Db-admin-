@@ -49,24 +49,41 @@ async function mustColl(name) {
 
 // ───────── تصنيف الأقسام (سيبراني / فلاش) + أسماء عربية ─────────
 const CYBER_LABELS = {
-    cyberaccess: ["👤 الحسابات (الصلاحيات)", "accounts"], cyberpanelmember: ["👥 أعضاء اللوحة", "accounts"], cybermemberactivity: ["📈 نشاط الأعضاء", "accounts"],
-    cyberevent: ["🛡️ الأحداث والعمليات المشبوهة", "violations"], cybereventimage: ["🖼️ صور الأحداث", "violations"],
-    cybervoicesess: ["🎙️ جلسات التسجيل الصوتي", "other"], cybervoicechunk: ["🎙️ مقاطع الصوت (تاخذ مساحة كبيرة)", "other"],
-    cybermsglog: ["💬 الرسائل المحذوفة", "other"], cyberban: ["🔨 الباندات", "other"], cyberinquiry: ["📨 الاستفسارات", "other"],
-    cyberdailystat: ["📊 إحصائيات يومية", "other"], cyberstatmeta: ["📊 بيانات الإحصائيات", "other"], cyberweekarchive: ["🗓️ أرشيف الأسابيع", "other"],
-    cyberjob: ["⚙️ طلبات الموقع للبوت", "other"], cyberrecjob: ["⚙️ طلبات صفحة التسجيل", "other"], cyberrecbot: ["🤖 بوتات التسجيل", "other"],
+    cyberaccess: ["👤 حسابات الصلاحيات", "accounts", "الحسابات اللي لها صلاحية دخول لوحة الأمن السيبراني."],
+    cyberpanelmember: ["👥 أعضاء اللوحة", "accounts", "الأعضاء المسجلين في لوحة الأمن السيبراني."],
+    cybermemberactivity: ["📈 نشاط الأعضاء", "accounts", "سجل نشاط أعضاء اللوحة (وش سوّوا ومتى)."],
+    cybercase: ["⚠️ القضايا والمخالفات", "violations", "القضايا المسجلة على الأعضاء — كل سجل = قضية / مخالفة وحدة."],
+    cyberevent: ["🛡️ الأحداث المشبوهة", "violations", "الأحداث والعمليات المشبوهة اللي رصدها البوت — كل سجل = حدث / مخالفة."],
+    cybereventimage: ["🖼️ صور الأحداث", "violations", "الصور المرفقة مع الأحداث المشبوهة (دليل المخالفة)."],
+    cybervoicesess: ["🎙️ جلسات التسجيل الصوتي", "other", "كل سجل = جلسة تسجيل صوتي بدأها البوت في روم صوتي."],
+    cybervoicechunk: ["🎙️ مقاطع الصوت", "other", "قطع صغيرة من التسجيل الصوتي — كل سجل = مقطع. (رقم الجلسة = الجلسة اللي ينتمي لها، رقم المقطع = ترتيبه، معرّف العضو = صاحب الصوت). تاخذ مساحة كبيرة، نظّفها إذا القاعدة قربت تمتلي."],
+    cybermsglog: ["💬 الرسائل المحذوفة", "other", "سجل الرسائل اللي انحذفت في السيرفر."],
+    cyberban: ["🔨 الباندات", "other", "سجل الأعضاء المحظورين (باند)."],
+    cyberinquiry: ["📨 الاستفسارات", "other", "الاستفسارات والطلبات المرسلة من الأعضاء."],
+    cyberdailystat: ["📊 إحصائيات يومية", "other", "أرقام وإحصائيات كل يوم."],
+    cyberstatmeta: ["📊 بيانات الإحصائيات", "other", "بيانات مساعدة للإحصائيات."],
+    cyberweekarchive: ["🗓️ أرشيف الأسابيع", "other", "أرشيف الإحصائيات الأسبوعية القديمة."],
+    cyberjob: ["⚙️ طلبات الموقع للبوت", "other", "أوامر ترسلها لوحة الموقع للبوت لينفذها."],
+    cyberrecjob: ["⚙️ طلبات صفحة التسجيل", "other", "أوامر ترسلها صفحة التسجيل للبوت لينفذها."],
+    cyberrecbot: ["🤖 بوتات التسجيل", "other", "بوتات التسجيل الصوتي المتصلة."],
 };
+// mongoose يحط اسم القسم بصيغة الجمع (cybercases / cybermemberactivities ...) فنجرب كل الصيغ
+function cyberInfo(low) {
+    const cands = [low, low.replace(/ies$/, "y"), low.replace(/es$/, ""), low.replace(/s$/, "")];
+    for (const x of cands) if (CYBER_LABELS[x]) return CYBER_LABELS[x];
+    return null;
+}
 const RX_ACC = /(user|account|member|access|officer|soldier|staff|person|profile|military|حساب)/i;
 const RX_VIO = /(violation|vio|fine|penalt|infraction|mokhalf|offence|offense|report|case|مخالف)/i;
 function classify(name) {
     const low = name.toLowerCase();
     if (low.startsWith("cyber")) {
-        const k = CYBER_LABELS[low];
-        return { proj: "cyber", label: k ? k[0] : "📁 " + name, kind: k ? k[1] : "other" };
+        const k = cyberInfo(low);
+        return { proj: "cyber", label: k ? k[0] : "📁 " + name, kind: k ? k[1] : "other", desc: k ? k[2] : "قسم ما له شرح مسجّل (اسمه في القاعدة: " + name + ")." };
     }
-    if (RX_VIO.test(name)) return { proj: "flash", label: "⚠️ المخالفات — " + name, kind: "violations" };
-    if (RX_ACC.test(name)) return { proj: "flash", label: "👤 الحسابات — " + name, kind: "accounts" };
-    return { proj: "flash", label: "📁 " + name, kind: "other" };
+    if (RX_VIO.test(name)) return { proj: "flash", label: "⚠️ المخالفات — " + name, kind: "violations", desc: "سجلات المخالفات في موقع فلاش — كل سجل = مخالفة." };
+    if (RX_ACC.test(name)) return { proj: "flash", label: "👤 الحسابات — " + name, kind: "accounts", desc: "حسابات المستخدمين في موقع فلاش." };
+    return { proj: "flash", label: "📁 " + name, kind: "other", desc: "قسم ما له شرح مسجّل (اسمه في القاعدة: " + name + ")." };
 }
 
 // ───────── كشف الصور وتجهيز العرض ─────────
@@ -238,7 +255,7 @@ h1,h2,h3{margin:0}.muted{color:#8aa0bf;font-size:13px}
 .tab.on{background:#2563eb;color:#fff;border-color:#60a5fa}.tab small{opacity:.75;margin-right:6px}
 .tool{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}.tool input[type=text],.in{background:#0e1b33;border:1px solid #29467a;color:#fff;border-radius:10px;padding:9px 12px;flex:1;min-width:160px}
 .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-.k{color:#60a5fa;font-size:12px}.kv{display:flex;gap:8px;padding:3px 0;border-bottom:1px dashed #1c3052;font-size:13px}.kv b{color:#7fb0ff;min-width:110px;font-weight:600}.kv span{flex:1;word-break:break-word;white-space:pre-wrap}
+.k{color:#60a5fa;font-size:12px}.kv{display:flex;gap:8px;padding:3px 0;border-bottom:1px dashed #1c3052;font-size:13px}.kv b{color:#7fb0ff;min-width:150px;font-weight:600}.en{display:block;color:#5b7399;font-size:10px;direction:ltr;text-align:right;font-weight:400}.sum{background:#0e1b33;border:1px solid #29467a;border-radius:10px;padding:8px 10px;margin:6px 0;font-size:13px;line-height:1.7}.desc{background:#0f2a4a;border:1px solid #2c4a7c;border-radius:12px;padding:10px 12px;margin-bottom:10px;font-size:13px;line-height:1.8;color:#cfe0ff}.kv span{flex:1;word-break:break-word;white-space:pre-wrap}
 pre{margin:0;font-size:12px;white-space:pre-wrap;word-break:break-word;color:#cfe0ff}
 .imgs{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0}.imgs img{height:120px;border-radius:10px;border:1px solid #2c4a7c;cursor:zoom-in;background:#0b1730;max-width:100%}
 .ov{position:fixed;inset:0;background:rgba(3,8,18,.82);display:flex;align-items:center;justify-content:center;padding:14px;z-index:50}
@@ -252,7 +269,7 @@ var $=function(i){return document.getElementById(i);};
 var S={ov:null,proj:null,coll:null,page:0,q:'',sel:{},docs:[]};
 var PN={cyber:['🛡️ الأمن السيبراني','b-cyber'],flash:['⚡ فلاش','b-flash']};
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
-function mb(b){b=b||0;return b<1048576?(b/1024).toFixed(0)+' KB':(b/1048576).toFixed(b<10485760?2:1)+' MB';}
+function mb(b){b=b||0;return b<1048576?(b/1024).toFixed(0)+' ك.ب':(b/1048576).toFixed(b<10485760?2:1)+' م.ب';}
 async function api(p,o){o=o||{};o.headers={'Content-Type':'application/json'};var r=await fetch(p,o);var j=await r.json().catch(function(){return {};});
   if(r.status===401&&p!=='/api/login'){showLogin();throw new Error('سجّل دخولك');}
   if(!r.ok)throw new Error(j.error||'خطأ');return j;}
@@ -291,8 +308,9 @@ function projColls(){
 function openProj(p){S.proj=p;var l=projColls();S.coll=l.length?l[0].name:null;S.page=0;S.q='';S.sel={};drawProj();if(S.coll)loadDocs();}
 function drawProj(){
   var l=projColls();
-  $('app').innerHTML='<div class="wrap"><div class="top"><div class="row"><button class="btn gray sm" id="bk">← رجوع</button><h2>'+PN[S.proj][0]+'</h2></div><span class="muted">'+mb(S.ov.used)+' / '+mb(S.ov.limit)+'</span></div>'
-   +(l.length?'<div class="tabs">'+l.map(function(c){return '<button class="tab'+(c.name===S.coll?' on':'')+'" data-c="'+esc(c.name)+'">'+esc(c.label)+'<small>'+c.count+' • '+mb(c.size)+'</small></button>';}).join('')+'</div>'
+  $('app').innerHTML='<div class="wrap"><div class="top"><div class="row"><button class="btn gray sm" id="bk">← رجوع</button><h2>'+PN[S.proj][0]+'</h2></div><span class="muted">'+mb(S.ov.used)+' من '+mb(S.ov.limit)+'</span></div>'
+   +(l.length?'<div class="tabs">'+l.map(function(c){return '<button class="tab'+(c.name===S.coll?' on':'')+'" data-c="'+esc(c.name)+'">'+esc(c.label)+'<small>'+c.count+' سجل • '+mb(c.size)+'</small></button>';}).join('')+'</div>'
+   +'<div class="desc">ℹ️ <b>'+esc((l.filter(function(c){return c.name===S.coll;})[0]||{}).label||'')+'</b><br>'+esc((l.filter(function(c){return c.name===S.coll;})[0]||{}).desc||'')+'</div>'
    +'<div class="tool"><input type="text" id="q" placeholder="بحث (نص أو معرّف)" value="'+esc(S.q)+'"><button class="btn sm" id="sq">بحث</button><button class="btn sm gray" id="rf">تحديث</button>'
    +'<button class="btn sm red" id="dsel" style="display:none"></button><button class="btn sm red" id="pg">🧹 تنظيف القسم</button></div><div id="list"></div><div id="pager" class="row" style="justify-content:center;margin:12px 0"></div>'
    :'<div class="card center muted">ما لقيت أقسام لهذا الموقع في القاعدة</div>')+'</div>';
@@ -304,14 +322,30 @@ function drawProj(){
   $('dsel').onclick=delSel;$('pg').onclick=purgeDlg;
 }
 async function refresh(){try{S.ov=await api('/api/overview');}catch(e){}drawProj();loadDocs();}
-function val(v){if(v!==null&&typeof v==='object')return '<pre>'+esc(JSON.stringify(v,null,1))+'</pre>';return esc(v);}
+var FAR={seq:'رقم المقطع',sid:'رقم الجلسة',uid:'معرّف العضو (ID)',__v:'نسخة السجل',createdAt:'تاريخ الإنشاء',updatedAt:'تاريخ آخر تعديل',data:'البيانات',
+  userId:'معرّف العضو',user:'العضو',guildId:'معرّف السيرفر',guild:'السيرفر',channelId:'معرّف الروم',channel:'الروم',messageId:'معرّف الرسالة',type:'النوع',kind:'النوع',
+  reason:'السبب',content:'المحتوى',text:'النص',status:'الحالة',name:'الاسم',username:'اسم المستخدم',title:'العنوان',description:'الوصف',moderator:'المشرف',
+  by:'بواسطة',action:'الإجراء',count:'العدد',date:'التاريخ',day:'اليوم',role:'الرتبة',roles:'الرتب',image:'صورة',images:'صور',url:'الرابط',duration:'المدة',
+  expiresAt:'ينتهي في',startedAt:'بدأ في',endedAt:'انتهى في',caseId:'رقم القضية',targetId:'معرّف المستهدف',target:'المستهدف',severity:'الخطورة',
+  note:'ملاحظة',notes:'ملاحظات',permissions:'الصلاحيات',level:'المستوى',code:'الرمز',id:'المعرّف',week:'الأسبوع',total:'الإجمالي',result:'النتيجة',evidence:'الدليل'};
+function fname(k){return FAR[k]?esc(FAR[k])+'<span class="en">'+esc(k)+'</span>':esc(k);}
+function fdate(s){return new Date(s).toLocaleString('ar-SA-u-ca-gregory');}
+function val(v){
+  if(v!==null&&typeof v==='object')return '<pre>'+esc(JSON.stringify(v,null,1))+'</pre>';
+  if(typeof v==='string'&&/^\d{4}-\d\d-\d\dT[\d:.]+Z$/.test(v))return esc(fdate(v));
+  if(v===true)return 'نعم';if(v===false)return 'لا';
+  return esc(v);}
+function summ(d){
+  var c=(S.ov.colls.filter(function(x){return x.name===S.coll;})[0]||{}),f=d.fields,n=String(c.name||'').toLowerCase();
+  if(/voicechunk/.test(n))return 'مقطع صوتي رقم '+esc(f.seq)+' من الجلسة '+esc(f.sid)+' — صاحب الصوت: '+esc(f.uid);
+  return '';}
 function card(d){
-  var keys=Object.keys(d.fields),ts=d.ts?new Date(d.ts).toLocaleString('ar-SA'):'';
-  var rows=keys.slice(0,10).map(function(k){return '<div class="kv"><b>'+esc(k)+'</b><span>'+val(d.fields[k])+'</span></div>';}).join('');
-  var more=keys.length>10?'<div id="m_'+esc(d.k)+'" style="display:none">'+keys.slice(10).map(function(k){return '<div class="kv"><b>'+esc(k)+'</b><span>'+val(d.fields[k])+'</span></div>';}).join('')+'</div><button class="btn gray sm" data-more="'+esc(d.k)+'" style="margin-top:6px">عرض الكل ('+keys.length+')</button>':'';
+  var keys=Object.keys(d.fields),ts=d.ts?new Date(d.ts).toLocaleString('ar-SA-u-ca-gregory'):'';
+  var rows=keys.slice(0,10).map(function(k){return '<div class="kv"><b>'+fname(k)+'</b><span>'+val(d.fields[k])+'</span></div>';}).join('');
+  var more=keys.length>10?'<div id="m_'+esc(d.k)+'" style="display:none">'+keys.slice(10).map(function(k){return '<div class="kv"><b>'+fname(k)+'</b><span>'+val(d.fields[k])+'</span></div>';}).join('')+'</div><button class="btn gray sm" data-more="'+esc(d.k)+'" style="margin-top:6px">عرض كل الحقول ('+keys.length+')</button>':'';
   var imgs=d.images.length?'<div class="imgs">'+d.images.map(function(i){return '<img loading="lazy" src="'+esc(i.src)+'" data-big="'+esc(i.src)+'" alt="">';}).join('')+'</div>':'';
   return '<div class="card"><div class="row" style="justify-content:space-between;margin-bottom:6px"><label class="row"><input type="checkbox" data-sel="'+esc(d.k)+'"'+(S.sel[d.k]?' checked':'')+'><span class="k">'+esc(d.k.slice(2))+(ts?' • '+ts:'')+'</span></label>'
-    +'<button class="btn red sm" data-del="'+esc(d.k)+'">🗑️ حذف</button></div>'+imgs+rows+more+'</div>';
+    +'<button class="btn red sm" data-del="'+esc(d.k)+'">🗑️ حذف</button></div>'+(summ(d)?'<div class="sum">📌 '+summ(d)+'</div>':'')+imgs+rows+more+'</div>';
 }
 async function loadDocs(){
   var L=$('list');if(!L)return;L.innerHTML='<div class="card center muted">جاري التحميل...</div>';
