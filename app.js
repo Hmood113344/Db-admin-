@@ -3,6 +3,7 @@
  * 🗄️ لوحة قاعدة البيانات — ملف واحد
  *   زرّين: الأمن السيبراني / فلاش  →  أقسام (الحسابات، المخالفات، ...) → عرض البيانات + الصور + حذف
  *   + زر «نقل من إلى» (نسخ أقسام من قاعدة لقاعدة) + زر «سجل القاعدة» (عرض محتوى أي قاعدة)
+ *   + زر ＋ فوق يمين: إنشاء موقع/بوت/أي شي (تحط رابط قاعدته) → صفحته: بار المساحة + تصفح + حذف + تعديل
  *   المتغيرات المطلوبة (Environment):  MONGO_URI  و  ADMIN_PASSWORD
  *   اختياري: PORT ، SESSION_SECRET ، DB_LIMIT_MB (الافتراضي 512)
  *   التشغيل: node db_admin.js      (يحتاج: express + mongoose بس)
@@ -38,13 +39,31 @@ const fromKey = k => {
 };
 const oidFromTime = ms => new mongoose.Types.ObjectId(Math.floor(ms / 1000).toString(16).padStart(8, "0") + "0000000000000000");
 
+// ───────── السجل: المواقع/القواعد اللي تضيفها من زر ＋ (الرابط ينحفظ مشفّر) ─────────
+const REG = "dbadmin_entries";
+const ENC_KEY = crypto.createHash("sha256").update("enc|" + SECRET).digest();
+const encStr = s => {
+    const iv = crypto.randomBytes(12), c = crypto.createCipheriv("aes-256-gcm", ENC_KEY, iv);
+    const e = Buffer.concat([c.update(String(s), "utf8"), c.final()]);
+    return iv.toString("hex") + ":" + c.getAuthTag().toString("hex") + ":" + e.toString("hex");
+};
+const decStr = s => {
+    try {
+        const [iv, tag, e] = String(s).split(":").map(x => Buffer.from(x, "hex"));
+        const d = crypto.createDecipheriv("aes-256-gcm", ENC_KEY, iv);
+        d.setAuthTag(tag);
+        return Buffer.concat([d.update(e), d.final()]).toString("utf8");
+    } catch { throw bad("تعذّر قراءة رابط القاعدة المحفوظ — يمكن تغيّرت كلمة المرور أو SESSION_SECRET. عدّل السجل وحط الرابط من جديد.", 500); }
+};
+const maskUri = u => String(u).replace(/^(mongodb(?:\+srv)?:\/\/)([^:@/]+):([^@]*)@/i, "$1$2:••••@");
+
 async function collNames() {
     const l = await db().listCollections({}, { nameOnly: true }).toArray();
-    return l.filter(c => c.type !== "view" && !c.name.startsWith("system.")).map(c => c.name);
+    return l.filter(c => c.type !== "view" && !c.name.startsWith("system.") && c.name !== REG).map(c => c.name);
 }
-async function mustColl(name) {
+async function mustColl(name, d) {
     name = String(name || "");
-    if (!(await collNames()).includes(name)) throw bad("القسم غير موجود", 404);
+    if (!(d ? await listNames(d) : await collNames()).includes(name)) throw bad("القسم غير موجود", 404);
     return name;
 }
 
@@ -108,9 +127,9 @@ function imgOfString(s) {
     if (/^https?:\/\/\S+$/.test(s) && (/\.(png|jpe?g|gif|webp|bmp)(\?.*)?$/i.test(s) || /(cdn\.discordapp\.com|media\.discordapp\.net|i\.imgur\.com)/i.test(s))) return { url: s };
     return null;
 }
-function view(coll, doc) {
+function view(coll, doc, eid) {
     const images = [], key = idKey(doc._id);
-    const blobUrl = p => "/api/blob?c=" + encodeURIComponent(coll) + "&k=" + encodeURIComponent(key) + "&p=" + encodeURIComponent(p);
+    const blobUrl = p => "/api/blob?c=" + encodeURIComponent(coll) + "&k=" + encodeURIComponent(key) + "&p=" + encodeURIComponent(p) + (eid ? "&e=" + encodeURIComponent(eid) : "");
     const walk = (v, path, d) => {
         if (v === null || v === undefined) return v;
         if (typeof v === "string") {
@@ -176,7 +195,7 @@ app.get("/api/overview", guard, wrap(async (req, res) => {
 }));
 
 app.get("/api/docs", guard, wrap(async (req, res) => {
-    const c = await mustColl(req.query.c), col = db().collection(c);
+    const D = await dbOf(req.query.e), c = await mustColl(req.query.c, D.ent ? D.db : null), col = D.db.collection(c);
     const page = Math.max(0, parseInt(req.query.page) || 0), per = 20;
     const q = String(req.query.q || "").trim();
     let filter = {};
@@ -190,12 +209,12 @@ app.get("/api/docs", guard, wrap(async (req, res) => {
         }
     }
     const [total, docs] = await Promise.all([col.countDocuments(filter), col.find(filter).sort({ _id: -1 }).skip(page * per).limit(per).toArray()]);
-    res.json({ total, per, page, docs: docs.map(d => view(c, d)) });
+    res.json({ total, per, page, docs: docs.map(d => view(c, d, req.query.e || "")) });
 }));
 
 app.get("/api/blob", guard, wrap(async (req, res) => {
-    const c = await mustColl(req.query.c);
-    const doc = await db().collection(c).findOne({ _id: fromKey(req.query.k) });
+    const D = await dbOf(req.query.e), c = await mustColl(req.query.c, D.ent ? D.db : null);
+    const doc = await D.db.collection(c).findOne({ _id: fromKey(req.query.k) });
     if (!doc) throw bad("غير موجود", 404);
     let v = doc; for (const p of String(req.query.p || "").split(".")) { if (v == null) break; v = v[p]; }
     let buf = null, mime = null;
@@ -212,23 +231,23 @@ app.get("/api/blob", guard, wrap(async (req, res) => {
 }));
 
 app.post("/api/delete", guard, wrap(async (req, res) => {
-    const c = await mustColl(req.body.c);
+    const D = await dbOf(req.body.e), c = await mustColl(req.body.c, D.ent ? D.db : null);
     const keys = Array.isArray(req.body.keys) ? req.body.keys.slice(0, 500) : [];
     if (!keys.length) throw bad("ما اخترت شي");
-    const r = await db().collection(c).deleteMany({ _id: { $in: keys.map(fromKey) } });
+    const r = await D.db.collection(c).deleteMany({ _id: { $in: keys.map(fromKey) } });
     res.json({ deleted: r.deletedCount });
 }));
 
 // حذف جماعي: أقدم من X يوم، أو الكل (drop + إعادة إنشاء الفهارس عشان المساحة تتحرر فعلاً)
 app.post("/api/purge", guard, wrap(async (req, res) => {
-    const c = await mustColl(req.body.c), col = db().collection(c), days = Number(req.body.days);
+    const D = await dbOf(req.body.e), c = await mustColl(req.body.c, D.ent ? D.db : null), col = D.db.collection(c), days = Number(req.body.days);
     if (days === 0) {
         if (req.body.confirm !== c) throw bad("اكتب اسم القسم بالضبط للتأكيد");
         let idx = []; try { idx = (await col.indexes()).filter(i => i.name !== "_id_").map(({ v, ns, ...r }) => r); } catch {}
         const before = await col.estimatedDocumentCount().catch(() => 0);
         await col.drop();
-        try { await db().createCollection(c); } catch {}
-        if (idx.length) { try { await db().collection(c).createIndexes(idx); } catch (e) { console.error("index restore:", e.message); } }
+        try { await D.db.createCollection(c); } catch {}
+        if (idx.length) { try { await D.db.collection(c).createIndexes(idx); } catch (e) { console.error("index restore:", e.message); } }
         return res.json({ deleted: before });
     }
     if (!(days > 0)) throw bad("عدد الأيام غير صحيح");
@@ -285,7 +304,7 @@ async function openConn(uri) {
     }
 }
 const listNames = async d => (await d.listCollections({}, { nameOnly: true }).toArray())
-    .filter(c => c.type !== "view" && !c.name.startsWith("system.")).map(c => c.name);
+    .filter(c => c.type !== "view" && !c.name.startsWith("system.") && c.name !== REG).map(c => c.name);
 
 async function inspectDb(conn, uri) {
     const d = conn.db;
@@ -415,6 +434,112 @@ app.get("/api/xfer/status", guard, wrap(async (req, res) => {
     res.json(pubJob(j));
 }));
 
+// ───────── المواقع/القواعد المسجّلة (زر ＋) ─────────
+// الاتصال بكل قاعدة يبقى مفتوح 5 دقايق وبعدها ينقفل لحاله
+const conns = new Map();
+const connDrop = id => { const c = conns.get(id); conns.delete(id); if (c) c.p.then(x => x.close()).catch(() => {}); };
+setInterval(() => { const now = Date.now(); for (const [id, c] of conns) if (now - c.t > 300000) connDrop(id); }, 60000).unref();
+const entId = v => {
+    v = String(v || "");
+    if (!/^[a-f0-9]{24}$/i.test(v)) throw bad("معرّف السجل غير صحيح");
+    return new mongoose.Types.ObjectId(v);
+};
+async function entryOf(id) {
+    const e = await db().collection(REG).findOne({ _id: entId(id) });
+    if (!e) throw bad("هذا السجل غير موجود (يمكن انحذف)", 404);
+    return e;
+}
+async function entryConn(id) {
+    id = String(id);
+    let c = conns.get(id);
+    if (!c) {
+        const e = await entryOf(id);
+        c = { p: openConn(decStr(e.uri)), t: 0 };
+        conns.set(id, c);
+        c.p.catch(() => { if (conns.get(id) === c) conns.delete(id); });
+    }
+    c.t = Date.now();
+    return c.p;
+}
+// يرجّع القاعدة المطلوبة: بدون id = القاعدة الرئيسية، ومعه id = قاعدة السجل
+async function dbOf(id) {
+    if (!id) return { db: db(), ent: false };
+    const c = await entryConn(id);
+    return { db: c.db, ent: true };
+}
+
+const ETYPES = ["site", "bot", "other"];
+const safeMask = e => { try { return maskUri(decStr(e.uri)); } catch { return "⚠️ تعذّر قراءة الرابط"; } };
+const pubEntry = e => ({ id: String(e._id), name: e.name, type: e.type || "site", limitMb: e.limitMb || LIMIT_MB, uri: safeMask(e) });
+function entryBody(b) {
+    const name = String(b.name || "").trim().slice(0, 60);
+    if (!name) throw bad("اكتب الاسم");
+    const type = ETYPES.includes(b.type) ? b.type : "site";
+    let limitMb = Number(b.limitMb);
+    if (!(limitMb > 0)) limitMb = LIMIT_MB;
+    return { name, type, limitMb: Math.min(limitMb, 10485760) };
+}
+
+app.get("/api/entries", guard, wrap(async (req, res) => {
+    const l = await db().collection(REG).find({}).sort({ _id: 1 }).toArray();
+    res.json({ entries: l.map(pubEntry) });
+}));
+
+// إنشاء سجل جديد، أو تعديل سجل (إذا جا id). في التعديل الرابط اختياري.
+app.post("/api/entry/save", guard, wrap(async (req, res) => {
+    const b = req.body || {}, f = entryBody(b), uri = String(b.uri || "").trim(), col = db().collection(REG);
+    const cur = b.id ? await entryOf(b.id) : null;
+    if (!cur && !uri) throw bad("ضع قاعدة البيانات");
+    if (!cur && (await col.countDocuments({})) >= 50) throw bad("وصلت الحد الأقصى (50 سجل) — احذف سجل قديم أول");
+    let hasDb = true;
+    if (uri) {
+        const c = await openConn(uri);
+        try {
+            await listNames(c.db).catch(() => { throw bad("اتصلت بالقاعدة بس ما قدرت أقرأها — تأكد من صلاحيات القراءة"); });
+            hasDb = /^mongodb(\+srv)?:\/\/[^/?]+\/[^?\s]+/i.test(uri);
+        } finally { c.close().catch(() => {}); }
+    }
+    if (cur) {
+        const set = { ...f };
+        if (uri) set.uri = encStr(uri);
+        await col.updateOne({ _id: cur._id }, { $set: set });
+        connDrop(String(cur._id));
+        return res.json({ id: String(cur._id), hasDb });
+    }
+    const r = await col.insertOne({ ...f, uri: encStr(uri), createdAt: new Date() });
+    res.json({ id: String(r.insertedId), hasDb });
+}));
+
+// نظرة كاملة على قاعدة السجل: المساحة المستخدمة + الأقسام
+app.get("/api/entry/overview", guard, wrap(async (req, res) => {
+    const e = await entryOf(req.query.id), conn = await entryConn(req.query.id);
+    const r = await inspectDb(conn, decStr(e.uri));
+    const st = await conn.db.command({ dbStats: 1 }).catch(() => null);
+    const used = st ? (st.dataSize || 0) + (st.indexSize || 0) : r.size;
+    res.json({ entry: pubEntry(e), used, limit: (e.limitMb || LIMIT_MB) * 1048576, dbName: r.name, hasDb: r.hasDb, colls: r.colls });
+}));
+
+// حذف السجل بس (بيانات القاعدة نفسها ما تنحذف)
+app.post("/api/entry/delete", guard, wrap(async (req, res) => {
+    const e = await entryOf(req.body.id);
+    await db().collection(REG).deleteOne({ _id: e._id });
+    connDrop(String(e._id));
+    res.json({ ok: true });
+}));
+
+// حذف كل البيانات اللي داخل القاعدة (يحذف الأقسام كلها) — السجل يبقى
+app.post("/api/entry/wipe", guard, wrap(async (req, res) => {
+    const e = await entryOf(req.body.id);
+    if (String(req.body.confirm || "").trim() !== e.name) throw bad("اكتب اسم السجل بالضبط للتأكيد");
+    const d = (await entryConn(req.body.id)).db, names = await listNames(d);
+    let records = 0, failed = 0;
+    for (const n of names) {
+        try { records += await d.collection(n).estimatedDocumentCount().catch(() => 0); await d.collection(n).drop(); }
+        catch (er) { failed++; console.error("wipe:", n, er.message); }
+    }
+    res.json({ colls: names.length - failed, records, failed });
+}));
+
 // ───────── الواجهة ─────────
 const CSS = String.raw`
 *{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-system,"Segoe UI",Tahoma,sans-serif;background:linear-gradient(160deg,#07101f,#0d2040);color:#e6edf7;min-height:100vh;direction:rtl}
@@ -447,11 +572,18 @@ pre{margin:0;font-size:12px;white-space:pre-wrap;word-break:break-word;color:#cf
 .xall{background:#0f2a4a;border:1px solid #2c4a7c;border-radius:10px;font-weight:700;margin:8px 0 4px}
 .ok{color:#4ade80}.warn{color:#fbbf24}.errt{color:#f87171}
 .pb{height:8px;background:#1a2c4a;border-radius:6px;overflow:hidden;margin:6px 0}.pb i{display:block;height:100%;background:linear-gradient(90deg,#22c55e,#3b82f6);transition:width .4s}
+.plus{width:42px;height:42px;border-radius:50%;border:0;background:linear-gradient(135deg,#16a34a,#22c55e);color:#fff;font-size:26px;line-height:1;padding:0;flex:none}
+.fl{display:block;margin:12px 0 5px;font-size:13px;color:#8aa0bf}
+.chip{white-space:nowrap;background:#16294a;color:#bcd0ee;border:1px solid #27406b;border-radius:10px;padding:8px 12px}.chip.on{background:#2563eb;color:#fff;border-color:#60a5fa}
+.ents{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px;margin-top:10px}
+.ent{text-align:right;background:linear-gradient(135deg,#0f2a4a,#16355f);border:1px solid #2c4a7c;color:#fff;border-radius:16px;padding:16px}.ent b{font-size:17px}.bar.mini{height:8px;margin:10px 0 6px}
+.md{max-height:92vh;overflow:auto}
 `;
 
 const CLIENT = String.raw`
 var $=function(i){return document.getElementById(i);};
-var S={ov:null,proj:null,coll:null,page:0,q:'',sel:{},docs:[]};
+var S={ov:null,proj:null,coll:null,page:0,q:'',sel:{},docs:[],eid:null,eov:null};
+var E={list:[]};
 var PN={cyber:['🛡️ الأمن السيبراني','b-cyber'],flash:['⚡ فلاش','b-flash']};
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
 function mb(b){b=b||0;return b<1048576?(b/1024).toFixed(0)+' ك.ب':(b/1048576).toFixed(b<10485760?2:1)+' م.ب';}
@@ -472,44 +604,59 @@ function showLogin(){
 }
 
 async function home(){
-  S.proj=null;S.coll=null;
+  S.proj=null;S.coll=null;S.eid=null;S.eov=null;
   $('app').innerHTML='<div class="wrap"><div class="card center muted">جاري التحميل...</div></div>';
   try{S.ov=await api('/api/overview');}catch(e){if(e.message!=='سجّل دخولك')toast(e.message);return;}
+  try{E.list=(await api('/api/entries')).entries;}catch(e){E.list=[];}
   var ov=S.ov,pct=Math.min(100,ov.used/ov.limit*100);
   var tot={cyber:{n:0,s:0},flash:{n:0,s:0}};
   ov.colls.forEach(function(c){tot[c.proj].n+=c.count;tot[c.proj].s+=c.size;});
-  $('app').innerHTML='<div class="wrap"><div class="top"><h2>🗄️ لوحة قاعدة البيانات</h2><button class="btn gray sm" id="lo">خروج</button></div>'
+  $('app').innerHTML='<div class="wrap"><div class="top"><div class="row"><button class="plus" id="pl" title="إنشاء موقع">＋</button><h2>🗄️ لوحة قاعدة البيانات</h2></div><button class="btn gray sm" id="lo">خروج</button></div>'
    +'<div class="card"><div class="row" style="justify-content:space-between"><b>المساحة المستخدمة</b><span>'+mb(ov.used)+' من '+mb(ov.limit)+'</span></div><div class="bar"><i style="width:'+pct.toFixed(1)+'%"></i></div>'
    +(pct>=95?'<div class="muted" style="color:#f87171">القاعدة مليانة — الكتابة موقوفة، احذف بيانات قديمة عشان ترجع تشتغل المواقع.</div>':'')+'</div>'
    +'<div class="big">'+['cyber','flash'].map(function(p){return '<button class="'+PN[p][1]+'" data-p="'+p+'">'+PN[p][0]+'<small>'+tot[p].n+' سجل — '+mb(tot[p].s)+'</small></button>';}).join('')+'</div>'
+   +'<div id="he"></div>'
    +'<div class="big wide" style="margin-top:14px"><button class="b-xfer" id="bx">🔄 نقل من إلى<small>انسخ البيانات من قاعدة بيانات لقاعدة ثانية</small></button></div>'
-   +'<div class="big wide" style="margin-top:14px"><button class="b-log" id="bl">📋 سجل القاعدة<small>شوف وش موجود داخل أي قاعدة بيانات</small></button></div></div>';
+   +'<div class="big wide" style="margin-top:14px"><button class="b-log" id="bl">📋 سجل القاعدة<small>القواعد المسجّلة عندك + شوف وش موجود داخل أي قاعدة بيانات</small></button></div></div>';
+  $('pl').onclick=function(){entryForm();};
   $('bx').onclick=openXfer;$('bl').onclick=openLog;
   $('lo').onclick=async function(){await api('/api/logout',{method:'POST'});showLogin();};
   document.querySelectorAll('.big button[data-p]').forEach(function(b){b.onclick=function(){openProj(b.getAttribute('data-p'));};});
+  entCards('he','📌 مواقعي',false);
 }
 
 function projColls(){
   var o={accounts:0,violations:1,other:2};
   return S.ov.colls.filter(function(c){return c.proj===S.proj;}).sort(function(a,b){return o[a.kind]-o[b.kind]||b.size-a.size;});
 }
-function openProj(p){S.proj=p;var l=projColls();S.coll=l.length?l[0].name:null;S.page=0;S.q='';S.sel={};drawProj();if(S.coll)loadDocs();}
-function drawProj(){
-  var l=projColls();
-  $('app').innerHTML='<div class="wrap"><div class="top"><div class="row"><button class="btn gray sm" id="bk">← رجوع</button><h2>'+PN[S.proj][0]+'</h2></div><span class="muted">'+mb(S.ov.used)+' من '+mb(S.ov.limit)+'</span></div>'
-   +(l.length?'<div class="tabs">'+l.map(function(c){return '<button class="tab'+(c.name===S.coll?' on':'')+'" data-c="'+esc(c.name)+'">'+esc(c.label)+'<small>'+c.count+' سجل • '+mb(c.size)+'</small></button>';}).join('')+'</div>'
-   +'<div class="desc">ℹ️ <b>'+esc((l.filter(function(c){return c.name===S.coll;})[0]||{}).label||'')+'</b><br>'+esc((l.filter(function(c){return c.name===S.coll;})[0]||{}).desc||'')+'</div>'
+function openProj(p){S.proj=p;S.eid=null;var l=projColls();S.coll=l.length?l[0].name:null;S.page=0;S.q='';S.sel={};drawProj();if(S.coll)loadDocs();}
+function curColls(){return S.eid&&S.eov?S.eov.colls:S.ov.colls;}
+function drawCur(){if(S.eid)drawEntry();else drawProj();}
+function browserHtml(l,emptyMsg){
+  if(!l.length)return '<div class="card center muted">'+emptyMsg+'</div>';
+  var cur=l.filter(function(c){return c.name===S.coll;})[0]||{};
+  return '<div class="tabs">'+l.map(function(c){return '<button class="tab'+(c.name===S.coll?' on':'')+'" data-c="'+esc(c.name)+'">'+esc(c.label)+'<small>'+c.count+' سجل • '+mb(c.size)+'</small></button>';}).join('')+'</div>'
+   +'<div class="desc">ℹ️ <b>'+esc(cur.label||'')+'</b><span class="en">'+esc(cur.name||'')+'</span>'+esc(cur.desc||'')+'</div>'
    +'<div class="tool"><input type="text" id="q" placeholder="بحث (نص أو معرّف)" value="'+esc(S.q)+'"><button class="btn sm" id="sq">بحث</button><button class="btn sm gray" id="rf">تحديث</button>'
-   +'<button class="btn sm red" id="dsel" style="display:none"></button><button class="btn sm red" id="pg">🧹 تنظيف القسم</button></div><div id="list"></div><div id="pager" class="row" style="justify-content:center;margin:12px 0"></div>'
-   :'<div class="card center muted">ما لقيت أقسام لهذا الموقع في القاعدة</div>')+'</div>';
-  $('bk').onclick=home;
+   +'<button class="btn sm red" id="dsel" style="display:none"></button><button class="btn sm red" id="pg">🧹 تنظيف القسم</button></div><div id="list"></div><div id="pager" class="row" style="justify-content:center;margin:12px 0"></div>';
+}
+function bindBrowser(l){
   if(!l.length)return;
-  document.querySelectorAll('.tab').forEach(function(t){t.onclick=function(){S.coll=t.getAttribute('data-c');S.page=0;S.q='';S.sel={};drawProj();loadDocs();};});
+  document.querySelectorAll('.tab').forEach(function(t){t.onclick=function(){S.coll=t.getAttribute('data-c');S.page=0;S.q='';S.sel={};drawCur();loadDocs();};});
   var sq=function(){S.q=$('q').value.trim();S.page=0;loadDocs();};
   $('sq').onclick=sq;$('q').onkeydown=function(e){if(e.key==='Enter')sq();};$('rf').onclick=function(){refresh();};
   $('dsel').onclick=delSel;$('pg').onclick=purgeDlg;
 }
-async function refresh(){try{S.ov=await api('/api/overview');}catch(e){}drawProj();loadDocs();}
+function drawProj(){
+  var l=projColls();
+  $('app').innerHTML='<div class="wrap"><div class="top"><div class="row"><button class="btn gray sm" id="bk">← رجوع</button><h2>'+PN[S.proj][0]+'</h2></div><span class="muted">'+mb(S.ov.used)+' من '+mb(S.ov.limit)+'</span></div>'
+   +browserHtml(l,'ما لقيت أقسام لهذا الموقع في القاعدة')+'</div>';
+  $('bk').onclick=home;
+  bindBrowser(l);
+}
+async function refresh(){
+  if(S.eid){try{S.eov=await api('/api/entry/overview?id='+encodeURIComponent(S.eid));}catch(e){toast(e.message);}if(S.eov)drawEntry();if(S.coll)loadDocs();return;}
+  try{S.ov=await api('/api/overview');}catch(e){}drawProj();loadDocs();}
 var FAR={seq:'رقم المقطع',sid:'رقم الجلسة',uid:'معرّف العضو (ID)',__v:'نسخة السجل',createdAt:'تاريخ الإنشاء',updatedAt:'تاريخ آخر تعديل',data:'البيانات',
   userId:'معرّف العضو',user:'العضو',guildId:'معرّف السيرفر',guild:'السيرفر',channelId:'معرّف الروم',channel:'الروم',messageId:'معرّف الرسالة',type:'النوع',kind:'النوع',
   reason:'السبب',content:'المحتوى',text:'النص',status:'الحالة',name:'الاسم',username:'اسم المستخدم',title:'العنوان',description:'الوصف',moderator:'المشرف',
@@ -524,7 +671,7 @@ function val(v){
   if(v===true)return 'نعم';if(v===false)return 'لا';
   return esc(v);}
 function summ(d){
-  var c=(S.ov.colls.filter(function(x){return x.name===S.coll;})[0]||{}),f=d.fields,n=String(c.name||'').toLowerCase();
+  var c=(curColls().filter(function(x){return x.name===S.coll;})[0]||{}),f=d.fields,n=String(c.name||'').toLowerCase();
   if(/voicechunk/.test(n))return 'مقطع صوتي رقم '+esc(f.seq)+' من الجلسة '+esc(f.sid)+' — صاحب الصوت: '+esc(f.uid);
   return '';}
 function card(d){
@@ -538,7 +685,7 @@ function card(d){
 async function loadDocs(){
   var L=$('list');if(!L)return;L.innerHTML='<div class="card center muted">جاري التحميل...</div>';
   try{
-    var j=await api('/api/docs?c='+encodeURIComponent(S.coll)+'&page='+S.page+'&q='+encodeURIComponent(S.q));
+    var j=await api('/api/docs?c='+encodeURIComponent(S.coll)+'&page='+S.page+'&q='+encodeURIComponent(S.q)+'&e='+encodeURIComponent(S.eid||''));
     S.docs=j.docs;
     L.innerHTML=j.docs.length?j.docs.map(card).join(''):'<div class="card center muted">ما فيه بيانات</div>';
     var pages=Math.max(1,Math.ceil(j.total/j.per));
@@ -549,7 +696,7 @@ async function loadDocs(){
 }
 function selUi(){var n=Object.keys(S.sel).length,b=$('dsel');if(!b)return;b.style.display=n?'':'none';b.textContent='🗑️ حذف المحدد ('+n+')';}
 async function doDelete(keys){
-  try{var r=await api('/api/delete',{method:'POST',body:JSON.stringify({c:S.coll,keys:keys})});toast('انحذف '+r.deleted);keys.forEach(function(k){delete S.sel[k];});refresh();}catch(e){toast(e.message);}
+  try{var r=await api('/api/delete',{method:'POST',body:JSON.stringify({c:S.coll,e:S.eid||'',keys:keys})});toast('انحذف '+r.deleted);keys.forEach(function(k){delete S.sel[k];});refresh();}catch(e){toast(e.message);}
 }
 async function delSel(){var k=Object.keys(S.sel);if(!k.length)return;if(await ask('تحذف '+k.length+' عنصر نهائياً؟ ما يرجعون.'))doDelete(k);}
 function purgeDlg(){
@@ -560,7 +707,7 @@ function purgeDlg(){
   $('pall').onclick=function(){purge({days:0,confirm:$('pc').value.trim()});};
 }
 async function purge(b){
-  b.c=S.coll;
+  b.c=S.coll;b.e=S.eid||'';
   try{var r=await api('/api/purge',{method:'POST',body:JSON.stringify(b)});closeM();toast('انحذف '+r.deleted+' سجل');S.page=0;refresh();}catch(e){toast(e.message);}
 }
 document.addEventListener('click',function(e){
@@ -570,6 +717,123 @@ document.addEventListener('click',function(e){
   var im=t.closest&&t.closest('[data-big]');if(im){modal('<div class="center"><img src="'+esc(im.getAttribute('data-big'))+'" alt=""></div>');return;}
 });
 document.addEventListener('change',function(e){var s=e.target.getAttribute&&e.target.getAttribute('data-sel');if(s){if(e.target.checked)S.sel[s]=1;else delete S.sel[s];selUi();}});
+
+/* ───────── المواقع/القواعد المسجّلة (زر ＋) ───────── */
+var TI={site:'🌐',bot:'🤖',other:'📦'},TN={site:'موقع',bot:'بوت',other:'غير ذلك'};
+function barColor(p){return p>=85?'#ef4444':p>=60?'#eab308':'#22c55e';}
+function bar(p){return '<div class="bar"><i style="width:'+p.toFixed(1)+'%;background:'+barColor(p)+'"></i></div>';}
+function entOf(id){return E.list.filter(function(x){return x.id===id;})[0]||null;}
+
+function entCards(elId,title,add){
+  var el=$(elId);if(!el)return;
+  if(!E.list.length&&!add){el.innerHTML='';return;}
+  el.innerHTML='<div class="row" style="justify-content:space-between;margin:16px 0 0"><h3>'+title+'</h3>'+(add?'<button class="btn sm" data-add="1">＋ إضافة</button>':'')+'</div>'
+   +(E.list.length?'<div class="ents">'+E.list.map(function(en){
+      return '<button class="ent" data-e="'+esc(en.id)+'"><b>'+TI[en.type]+' '+esc(en.name)+'</b><div class="bar mini"><i id="eb_'+esc(en.id)+'" style="width:0"></i></div><small class="muted" id="es_'+esc(en.id)+'">⏳ جاري الاتصال...</small></button>';}).join('')+'</div>'
+    :'<div class="card center muted" style="margin-top:8px">ما سجّلت شي بعد — اضغط ＋ وحط قاعدة بياناته</div>');
+  E.list.forEach(function(en){entStat(en.id);});
+}
+async function entStat(id){
+  try{
+    var o=await api('/api/entry/overview?id='+encodeURIComponent(id));
+    var p=Math.min(100,o.limit?o.used/o.limit*100:0),b=$('eb_'+id),s=$('es_'+id),n=0;
+    o.colls.forEach(function(c){n+=c.count;});
+    if(b){b.style.width=p.toFixed(1)+'%';b.style.background=barColor(p);}
+    if(s)s.textContent=n+' سجل — '+mb(o.used)+' من '+mb(o.limit);
+  }catch(e){var s2=$('es_'+id);if(s2){s2.textContent='❌ '+e.message;s2.className='errt';}}
+}
+
+function entryForm(en){
+  var ed=!!en,ty=ed?en.type:'site',NL={site:'اسم الموقع',bot:'اسم البوت',other:'الاسم'};
+  var chips=Object.keys(TI).map(function(k){return '<button type="button" class="chip'+(k===ty?' on':'')+'" data-ty="'+k+'">'+TI[k]+' '+TN[k]+'</button>';}).join('');
+  var dl=S.ov?Math.round(S.ov.limit/1048576):512;
+  modal('<h3>'+(ed?'✏️ تعديل السجل':'➕ إنشاء موقع')+'</h3>'
+   +'<label class="fl">ضع قاعدة البيانات</label><input class="in" id="fu" type="text" placeholder="'+(ed?'اتركه فاضي إذا ما تبي تغيّر القاعدة':'mongodb+srv://...')+'" autocomplete="off" spellcheck="false" style="width:100%;direction:ltr;text-align:left">'
+   +(ed?'<div class="muted" style="margin-top:4px;direction:ltr;text-align:left;word-break:break-all">'+esc(en.uri)+'</div>':'')
+   +'<label class="fl" id="fnl">'+NL[ty]+'</label><input class="in" id="fn" type="text" maxlength="60" style="width:100%" value="'+esc(ed?en.name:'')+'">'
+   +'<label class="fl">النوع</label><div class="row">'+chips+'</div>'
+   +'<label class="fl">أقصى مساحة للقاعدة (م.ب) — عشان يحسب البار</label><input class="in" id="fl" type="number" min="1" style="width:100%" value="'+(ed?en.limitMb:dl)+'">'
+   +'<div class="row" style="margin-top:14px"><button class="btn" id="fs">'+(ed?'حفظ':'إنشاء')+'</button><button class="btn gray" id="fc">إلغاء</button></div>');
+  document.querySelectorAll('[data-ty]').forEach(function(b){b.onclick=function(){
+    ty=b.getAttribute('data-ty');
+    document.querySelectorAll('[data-ty]').forEach(function(x){x.classList.toggle('on',x===b);});
+    $('fnl').textContent=NL[ty];};});
+  $('fc').onclick=closeM;
+  var save=async function(){
+    var u=$('fu').value.trim(),n=$('fn').value.trim(),btn=$('fs');
+    if(!ed&&!u){toast('ضع قاعدة البيانات أول');return;}
+    if(!n){toast('اكتب الاسم');return;}
+    btn.disabled=true;btn.textContent='⏳ جاري الاتصال...';
+    try{
+      var r=await api('/api/entry/save',{method:'POST',body:JSON.stringify({id:ed?en.id:undefined,uri:u,name:n,type:ty,limitMb:Number($('fl').value)})});
+      closeM();
+      toast((ed?'✅ تم حفظ التعديل':'✅ تم إنشاء «'+n+'»')+(r.hasDb?'':' — تنبيه: الرابط ما فيه اسم قاعدة'));
+      try{E.list=(await api('/api/entries')).entries;}catch(e2){}
+      if(ed)openEntry(en.id);else home();
+    }catch(e){var b2=$('fs');if(b2){b2.disabled=false;b2.textContent=ed?'حفظ':'إنشاء';}toast(e.message);}
+  };
+  $('fs').onclick=save;
+  ['fu','fn','fl'].forEach(function(i){$(i).onkeydown=function(e){if(e.key==='Enter')save();};});
+  $(ed?'fn':'fu').focus();
+}
+
+async function openEntry(id){
+  S.proj=null;S.eid=id;S.coll=null;S.page=0;S.q='';S.sel={};S.eov=null;
+  $('app').innerHTML='<div class="wrap"><div class="card center muted">⏳ جاري الاتصال بالقاعدة...</div></div>';
+  var er='';
+  try{S.eov=await api('/api/entry/overview?id='+encodeURIComponent(id));}catch(e){if(e.message==='سجّل دخولك')return;er=e.message;}
+  if(!S.eov){entFail(id,er);return;}
+  var l=S.eov.colls;S.coll=l.length?l[0].name:null;
+  drawEntry();if(S.coll)loadDocs();
+}
+function entFail(id,er){
+  var en=entOf(id)||{id:id,name:'السجل'};
+  $('app').innerHTML='<div class="wrap"><div class="top"><div class="row"><button class="btn gray sm" id="bk">← رجوع</button><h2>'+esc(en.name)+'</h2></div></div>'
+   +'<div class="card"><div class="errt">❌ '+esc(er)+'</div><div class="muted" style="margin-top:8px">تقدر تعدّل رابط القاعدة أو تحذف السجل.</div></div>'
+   +'<div class="row"><button class="btn sm" id="ee">✏️ تعديل</button><button class="btn sm gray" id="er">🔄 إعادة المحاولة</button><button class="btn sm red" id="ed">🗑️ حذف السجل</button></div></div>';
+  $('bk').onclick=home;
+  $('ee').onclick=function(){if(entOf(id))entryForm(entOf(id));};
+  $('er').onclick=function(){openEntry(id);};
+  $('ed').onclick=function(){entDel(id,en.name);};
+}
+function drawEntry(){
+  var o=S.eov,en=o.entry,l=o.colls,tot=0;
+  l.forEach(function(c){tot+=c.count;});
+  var pct=Math.min(100,o.limit?o.used/o.limit*100:0);
+  if(!l.some(function(c){return c.name===S.coll;}))S.coll=l.length?l[0].name:null;
+  $('app').innerHTML='<div class="wrap"><div class="top"><div class="row"><button class="btn gray sm" id="bk">← رجوع</button><h2>'+TI[en.type]+' '+esc(en.name)+'</h2></div></div>'
+   +'<div class="card"><div class="row" style="justify-content:space-between"><b>المساحة المستخدمة</b><span>'+mb(o.used)+' من '+mb(o.limit)+'</span></div>'+bar(pct)
+   +'<div class="muted">'+pct.toFixed(1)+'% مستخدم • '+l.length+' قسم • '+tot+' سجل • القاعدة: <b style="direction:ltr;unicode-bidi:embed">'+esc(o.dbName)+'</b></div>'
+   +(o.hasDb?'':'<div class="warn" style="font-size:13px;margin-top:6px">⚠️ الرابط ما فيه اسم قاعدة، فهذي القاعدة الافتراضية.</div>')
+   +(pct>=95?'<div class="errt" style="font-size:13px;margin-top:6px">القاعدة شبه مليانة — احذف بيانات قديمة عشان ما تتوقف الكتابة.</div>':'')+'</div>'
+   +'<div class="row" style="margin-bottom:12px"><button class="btn sm" id="ee">✏️ تعديل</button><button class="btn sm red" id="ew">🧨 حذف كل بيانات القاعدة</button><button class="btn sm red" id="ed">🗑️ حذف السجل</button></div>'
+   +browserHtml(l,'القاعدة فاضية ما فيها بيانات')+'</div>';
+  $('bk').onclick=home;
+  $('ee').onclick=function(){entryForm(en);};
+  $('ew').onclick=function(){entWipe(en,o,tot);};
+  $('ed').onclick=function(){entDel(en.id,en.name);};
+  bindBrowser(l);
+}
+async function entDel(id,name){
+  if(!(await ask('تحذف السجل «'+name+'» من اللوحة؟ بيانات القاعدة نفسها ما تنحذف، بس يختفي من هنا.','نعم، احذف السجل')))return;
+  try{await api('/api/entry/delete',{method:'POST',body:JSON.stringify({id:id})});toast('انحذف السجل');home();}catch(e){toast(e.message);}
+}
+function entWipe(en,o,tot){
+  modal('<h3>🧨 حذف كل بيانات القاعدة</h3><p class="muted" style="line-height:1.8">بيتحذف كل شي داخل القاعدة ('+o.colls.length+' قسم • '+tot+' سجل) نهائياً وما يرجع. السجل نفسه يبقى في اللوحة.</p>'
+   +'<p class="muted">اكتب اسم السجل للتأكيد:</p><div class="muted" style="color:#fbbf24">'+esc(en.name)+'</div>'
+   +'<input class="in" id="wc" type="text" style="width:100%;margin:8px 0" placeholder="اكتب الاسم أعلاه"><button class="btn red" id="wgo" style="width:100%">حذف كل البيانات</button><button class="btn gray" onclick="closeM()" style="width:100%;margin-top:8px">إلغاء</button>');
+  $('wgo').onclick=async function(){
+    try{
+      var r=await api('/api/entry/wipe',{method:'POST',body:JSON.stringify({id:en.id,confirm:$('wc').value.trim()})});
+      closeM();toast('انحذف '+r.colls+' قسم ('+r.records+' سجل)'+(r.failed?' — وفشل حذف '+r.failed:''));S.coll=null;S.page=0;S.q='';S.sel={};refresh();
+    }catch(e){toast(e.message);}
+  };
+}
+document.addEventListener('click',function(e){
+  var t=e.target;
+  var a=t.closest&&t.closest('[data-add]');if(a){entryForm();return;}
+  var en=t.closest&&t.closest('[data-e]');if(en){openEntry(en.getAttribute('data-e'));}
+});
 
 /* ───────── نقل من إلى ───────── */
 var X={fromUri:'',toUri:'',from:null,to:null,sel:{},err:{},busy:{},timer:null,running:false,jobId:null};
@@ -681,12 +945,13 @@ var LG={uri:'',data:null,err:'',busy:false};
 function openLog(){
   S.proj=null;
   $('app').innerHTML='<div class="wrap"><div class="top"><div class="row"><button class="btn gray sm" id="bk">← رجوع</button><h2>📋 سجل القاعدة</h2></div></div>'
-   +'<div class="card"><div class="muted" style="margin-bottom:8px">ضع القاعدة اللي تبي تشوف وش موجود فيها</div><div class="tool"><input type="text" class="in" id="lu" placeholder="ضع قاعدة بيانات" value="'+esc(LG.uri)+'" autocomplete="off" spellcheck="false" style="direction:ltr;text-align:left"><button class="btn sm" id="ls">بحث</button></div></div><div id="lr"></div></div>';
+   +'<div id="le"></div><h3 style="margin:16px 0 8px">🔎 فحص قاعدة بدون تسجيل</h3><div class="card"><div class="muted" style="margin-bottom:8px">ضع القاعدة اللي تبي تشوف وش موجود فيها</div><div class="tool"><input type="text" class="in" id="lu" placeholder="ضع قاعدة بيانات" value="'+esc(LG.uri)+'" autocomplete="off" spellcheck="false" style="direction:ltr;text-align:left"><button class="btn sm" id="ls">بحث</button></div></div><div id="lr"></div></div>';
   $('bk').onclick=home;
   $('ls').onclick=logSearch;
   $('lu').onkeydown=function(e){if(e.key==='Enter')logSearch();};
   $('lu').oninput=function(){LG.uri=$('lu').value.trim();};
   logRes();
+  entCards('le','📌 المسجّل عندك',true);
 }
 async function logSearch(){
   var el=$('lu');if(!el)return;
